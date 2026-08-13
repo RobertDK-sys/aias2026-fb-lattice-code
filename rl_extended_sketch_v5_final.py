@@ -3,8 +3,14 @@ rl_extended_sketch_v5_final.py
 Intégration complète :
 1. Ef dynamique (EWMA) dérivé de la mesure physique
 2. Conservation de sort_mismatch comme diagnostic (pas comme garde-fou)
-3. Séparation stricte entre branche négative du modèle et triangularité physique observée
-4. Règle d'appariement : si pas de triangularité négative physique, ne jamais utiliser E_internal < 0
+3. Règle d'éligibilité de la triangularité négative du modèle : le signe négatif
+   de E_internal dans la table de référence n'est jamais une énergie négative
+   (Ec >= 0 toujours) mais une étiquette de triangularité négative ; un point
+   modèle à E_internal < 0 ne peut être apparié que si la triangularité
+   négative est effectivement observée côté physique, et dans ce cas
+   l'appariement se fait avec les valeurs d'énergie {|E_internal[i]|, E_external[i]}
+4. Règle d'appariement : si pas de triangularité négative physique observée, ne
+   jamais utiliser les points modèle à E_internal < 0
 5. Utilisation systématique de [-n_b, n_b] comme plage k
 6. Format d'affichage identique à v3
 """
@@ -186,9 +192,20 @@ class AssociationIndex:
     def __init__(self, ref: ReferenceTable, d_seuil: float = 1.0):
         self.ref = ref
         self.d_seuil = d_seuil
-        z_int = np.array([ref.normalize(e_i, e_e)[0]
+        # CORRECTIF : la géométrie de recherche est construite à partir de
+        # {|E_internal[i]|, E_external[i]}, jamais de E_internal signé.
+        # Rappel de la règle : le signe négatif de E_internal dans la table
+        # de référence n'indique pas une énergie négative (Ec = (1/2)m(vx²+vy²+vz²) >= 0
+        # est toujours positive) -- c'est une étiquette indiquant qu'il faut
+        # associer/chercher une triangularité négative, mais avec les valeurs
+        # d'énergie {|E_internal[i]|, E_external[i]}. Le fait qu'un point modèle
+        # soit éligible ou non à cette étiquette (E_internal < 0) est décidé
+        # séparément par le filtre allow_negative dans query()/sorted_expectation() ;
+        # ici, on ne fait que garantir que la distance géométrique elle-même
+        # est calculée sur des grandeurs d'énergie toujours positives.
+        z_int = np.array([ref.normalize(abs(e_i), e_e)[0]
                            for e_i, e_e in zip(ref.E_internal, ref.E_external)])
-        z_ext = np.array([ref.normalize(e_i, e_e)[1]
+        z_ext = np.array([ref.normalize(abs(e_i), e_e)[1]
                            for e_i, e_e in zip(ref.E_internal, ref.E_external)])
         finite_mask = np.isfinite(z_int) & np.isfinite(z_ext)
         self._j_index = np.where(finite_mask)[0]
@@ -197,20 +214,30 @@ class AssociationIndex:
 
     def query(self, e_int_obs: float, e_ext_obs: float, allow_negative: bool = True):
         """
-        INTERDIT l'appariement à des E_internal < 0 si allow_negative=False.
-        C'est la règle stricte de séparation entre branche négative du modèle
-        et triangularité physique réellement observée.
+        INTERDIT l'appariement à des points modèle E_internal < 0 si
+        allow_negative=False. Règle d'éligibilité de la triangularité négative :
+        un point modèle à E_internal < 0 ne représente jamais une énergie
+        négative -- c'est une étiquette de triangularité négative -- et il ne
+        peut être utilisé pour l'appariement que si la triangularité négative
+        est effectivement observée dans les données physiques.
+
+        Conséquence géométrique : la comparaison se fait toujours dans l'espace
+        {|E_internal|, E_external} (jamais sur E_internal signé), afin qu'un
+        point physique (toujours positif) puisse correctement se rapprocher
+        d'un point modèle à triangularité négative en utilisant ses valeurs
+        d'énergie {|E_internal[i]|, E_external[i]} -- seule son éligibilité
+        (via allow_negative) dépend du signe.
         """
         if len(self._j_index) == 0:
             return {"j_star": None, "D1": float("inf"), "D2": float("inf"),
                     "delta_D": 0.0, "N": 0}
 
-        z_i_obs, z_e_obs = self.ref.normalize(e_int_obs, e_ext_obs)
+        z_i_obs, z_e_obs = self.ref.normalize(abs(e_int_obs), e_ext_obs)
         d = np.hypot(self._z_int - z_i_obs, self._z_ext - z_e_obs)
 
         # Filtre optionnel : exclure les E_internal < 0 du modèle
         if not allow_negative:
-            valid_mask = np.array([self.ref.E_internal[int(j)] >= 0 
+            valid_mask = np.array([self.ref.E_internal[int(j)] >= 0
                                    for j in self._j_index])
             d = d.copy()
             d[~valid_mask] = np.inf
@@ -248,17 +275,21 @@ class AssociationIndex:
             "N": n_within,
         }
 
-    def sorted_expectation(self, e_int_obs: float, e_ext_obs: float, 
+    def sorted_expectation(self, e_int_obs: float, e_ext_obs: float,
                            allow_negative: bool = True, k_neighbors: int = 50):
         """
         Diagnostic sort_mismatch conservé (v4), MAIS avec le même filtre
-        négatif/positif. Ne déclenche jamais de disruption -- purement informatif.
+        d'éligibilité de la triangularité négative que query(). Ne déclenche
+        jamais de disruption -- purement informatif.
         """
-        z_i_obs, z_e_obs = self.ref.normalize(e_int_obs, e_ext_obs)
+        # CORRECTIF (même règle que dans query()) : comparaison dans l'espace
+        # {|E_internal|, E_external}, car E_internal négatif est une étiquette
+        # de triangularité et non une énergie négative.
+        z_i_obs, z_e_obs = self.ref.normalize(abs(e_int_obs), e_ext_obs)
         d = np.hypot(self._z_int - z_i_obs, self._z_ext - z_e_obs)
 
         if not allow_negative:
-            valid_mask = np.array([self.ref.E_internal[int(j)] >= 0 
+            valid_mask = np.array([self.ref.E_internal[int(j)] >= 0
                                    for j in self._j_index])
             d = d.copy()
             d[~valid_mask] = np.inf
@@ -285,7 +316,7 @@ class AssociationIndex:
         return float(e_ext_sorted[rank]), len(j_neigh)
 
 
-def ef_from_physical(e_int_phys: float, e_ext_phys: float, 
+def ef_from_physical(e_int_phys: float, e_ext_phys: float,
                      ef_prev: Optional[float] = None, alpha: float = 0.1) -> float:
     """
     Ef dynamique dérivé de la mesure physique (EWMA).
@@ -342,9 +373,14 @@ class NBISequencingEnvV5:
     Version finale intégrant :
     - Ef dynamique (EWMA) dérivé de la mesure physique
     - sort_mismatch conservé comme diagnostic (jamais disruptif)
-    - Séparation stricte négatif/positif pour l'appariement
+    - Règle d'éligibilité de la triangularité négative pour l'appariement :
+      un point modèle à E_internal < 0 est une étiquette de triangularité
+      négative, jamais une énergie négative ; il n'est utilisable pour
+      l'appariement que si la triangularité négative est effectivement
+      observée côté physique, auquel cas l'appariement utilise les valeurs
+      d'énergie {|E_internal[i]|, E_external[i]}
     - Règle : si pas de triangularité négative physique observée,
-      ne JAMAIS apparier à des E_internal < 0 du modèle
+      ne JAMAIS apparier à des points modèle E_internal < 0
     """
     ACTIONS = [1, 2, 3, 5, 8]
 
@@ -360,10 +396,12 @@ class NBISequencingEnvV5:
         self.d_seuil = d_seuil
         self.alpha_ef = alpha_ef
         self.max_i = max_i
-        # NOUVEAU : séparation stricte entre branche négative du modèle
-        # et triangularité physique observée. Si True (défaut), les E_internal < 0
-        # du modèle ne sont jamais utilisés pour l'appariement, SAUF si la source
-        # physique indique explicitement une triangularité négative observée.
+        # NOUVEAU : applique la règle d'éligibilité de la triangularité négative.
+        # Si True (défaut), les points modèle à E_internal < 0 ne sont jamais
+        # utilisés pour l'appariement, SAUF si la source physique indique
+        # explicitement une triangularité négative observée -- auquel cas
+        # l'appariement se fait avec les valeurs d'énergie {|E_internal[i]|,
+        # E_external[i]}, jamais avec une énergie considérée comme négative.
         self.separation_neg_pos = separation_neg_pos
 
         # Ef dynamique : initialisé à partir de la première mesure ou base device
@@ -382,7 +420,10 @@ class NBISequencingEnvV5:
         dans les données physiques. Par défaut : NON -- car la triangularité
         négative est un effet géométrique (bobines poloïdales) qui n'apparaît
         que si spécifiquement demandé. Le signe de E_internal,phys n'est PAS
-        un indicateur de triangularité (l'énergie ne peut pas être négative).
+        un indicateur de triangularité (l'énergie physique ne peut pas être
+        négative : Ec >= 0 toujours). C'est cette méthode, et elle seule, qui
+        décide si les points modèle à E_internal < 0 (étiquette de
+        triangularité négative) deviennent éligibles à l'appariement.
         """
         return False  # Par défaut : pas de triangularité négative observée
 
@@ -399,7 +440,7 @@ class NBISequencingEnvV5:
 
     def _state(self):
         e_int, e_ext = self.feed.get(self.i)
-        
+
         # Mise à jour dynamique de Ef(i) par EWMA basée sur la mesure physique
         if math.isfinite(e_int) and math.isfinite(e_ext):
             prev_ef = self.current_Ef
@@ -433,7 +474,7 @@ class NBISequencingEnvV5:
         jump = self.ACTIONS[action_idx]
         new_i = min(self.i + jump, self.max_i)
         self.i = new_i
-        
+
         state = self._state()  # Met à jour Ef, table, et calcule l'état
         e_int, e_ext = self.feed.get(self.i)
 
@@ -442,7 +483,7 @@ class NBISequencingEnvV5:
             return state, -10.0, True, {"reason": "etat_non_physique"}
 
         ratio = abs(e_int / e_ext)
-        
+
         # Déterminer si la triangularité négative est observée
         allow_negative = not self.separation_neg_pos
         if self.separation_neg_pos:
@@ -588,8 +629,8 @@ if __name__ == "__main__":
     # Vérification de l'identité algébrique
     print("\n--- Vérification de fidélité des formules ---")
     ref_test = ReferenceTable(fb_lattice, Ef=Ef_REF)
-    max_err = max(abs(ei + ee - Ef_REF) 
-                  for ei, ee in zip(ref_test.E_internal, ref_test.E_external) 
+    max_err = max(abs(ei + ee - Ef_REF)
+                  for ei, ee in zip(ref_test.E_internal, ref_test.E_external)
                   if math.isfinite(ei) and math.isfinite(ee))
     n_neg = sum(1 for ei in ref_test.E_internal if math.isfinite(ei) and ei < 0)
     n_pos = sum(1 for ei in ref_test.E_internal if math.isfinite(ei) and ei >= 0)
